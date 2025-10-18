@@ -3,12 +3,21 @@
 
 from typing import List
 
-import MinkowskiEngine as ME
+try:
+    import MinkowskiEngine as ME
+    _HAS_ME = True
+except Exception:
+    ME = None
+    _HAS_ME = False
 import numpy as np
 import torch.nn
 import torch.nn.functional as F
-from pytorch3d.ops import packed_to_padded, ball_query
-
+try:
+    from pytorch3d.ops import packed_to_padded as _p2p, ball_query as _bq
+    _HAS_P3D = True
+except Exception:
+    _HAS_P3D = False
+import torch, logging
 # # Uncomment the following two lines if you want to use the CPU operations for KPConv
 # # preprocessing (you'll need to compile the code using the included bash scripts)
 # from .cpp_wrappers.cpp_subsampling import grid_subsampling as cpp_subsampling
@@ -18,6 +27,71 @@ from .kpconv_blocks import *
 
 _logger = logging.getLogger(__name__)
 
+
+def packed_to_padded(packed: torch.Tensor, first_idxs: torch.Tensor, maxlen: int):
+    """
+    替代 pytorch3d.ops.packed_to_padded
+    packed: (sum_i Ni, C)
+    first_idxs: (B,) 起始下标 [0, N0, N0+N1, ...]
+    maxlen: 需要 pad 到的长度（通常 = q_batches.max()）
+    return: (B, maxlen, C)
+    """
+    if _HAS_P3D:
+        return _p2p(packed, first_idxs, maxlen)
+
+    B = int(first_idxs.numel())
+    C = packed.shape[1]
+    device = packed.device
+    # 计算每个 batch 的长度
+    lens = torch.empty(B, dtype=torch.long, device=device)
+    lens[:-1] = first_idxs[1:] - first_idxs[:-1]
+    lens[-1] = packed.shape[0] - first_idxs[-1]
+    out = packed.new_zeros((B, maxlen, C))
+    for b in range(B):
+        n = int(lens[b].item())
+        if n > 0:
+            out[b, :n] = packed[first_idxs[b]:first_idxs[b] + n]
+    return out
+
+class _BallQueryResult:
+    def __init__(self, idx: torch.Tensor):
+        self.idx = idx
+
+def ball_query(queries_padded: torch.Tensor,
+               supports_padded: torch.Tensor,
+               q_batches: torch.Tensor,
+               s_batches: torch.Tensor,
+               K: int,
+               radius: float):
+    """
+    替代 pytorch3d.ops.ball_query
+    返回对象含 .idx，形状 (B, Nq_max, K)，无邻居处为 -1
+    复杂度 O(Nq*Ns)，demo 可用；大规模训练会慢。
+    """
+    if _HAS_P3D:
+        return _bq(queries_padded, supports_padded, q_batches, s_batches, K=K, radius=radius)
+
+    device = queries_padded.device
+    B, Nq_max, _ = queries_padded.shape
+    _, Ns_max, _ = supports_padded.shape
+    out = torch.full((B, Nq_max, K), -1, device=device, dtype=torch.long)
+    inf = torch.finfo(queries_padded.dtype).max
+
+    for b in range(B):
+        nq = int(q_batches[b].item())
+        ns = int(s_batches[b].item())
+        if nq == 0 or ns == 0:
+            continue
+        Q = queries_padded[b, :nq]           # (nq, 3)
+        S = supports_padded[b, :ns]          # (ns, 3)
+        D = torch.cdist(Q, S)                # (nq, ns)
+        mask = D <= radius
+        D_masked = D.masked_fill(~mask, inf) # 非邻居置为 +inf
+        vals, idxs = torch.topk(D_masked, k=K, dim=1, largest=False)
+        idxs[vals == inf] = -1               # 没满 K 的填 -1
+        out[b, :nq] = idxs.to(torch.long)
+
+    return _BallQueryResult(out)
 
 class KPFEncoder(torch.nn.Module):
     def __init__(self, config, d_bottle, increase_channel_when_downsample=True):
@@ -210,6 +284,44 @@ def batch_grid_subsampling_kpconv(points, batches_len, features=None, labels=Non
             s_labels)
 
 
+def _voxel_subsample_torch(points, batches_len, sampleDl):
+    """
+    纯 PyTorch 的体素网格下采样：
+    - points: (N, 3) FloatTensor (设备同调用方)
+    - batches_len: (B,) Long/Int Tensor
+    返回:
+      s_points: 下采样后的拼接点 (sum_i Ni', 3)
+      s_len   : 每个 batch 的下采样点数 (B,)
+    """
+    B = len(batches_len)
+    # 累加出每个 batch 起止索引
+    batch_start_end = torch.nn.functional.pad(torch.cumsum(batches_len.to(torch.long), 0), (1, 0))
+    outs = []
+    lens = []
+    for b in range(B):
+        start = int(batch_start_end[b].item())
+        end = int(batch_start_end[b + 1].item())
+        xyz = points[start:end]  # (Nb, 3)
+
+        # 体素键：floor(x/sampleDl)
+        keys = torch.floor(xyz / sampleDl).to(torch.long)  # (Nb, 3)
+
+        # 唯一体素 + 反向映射
+        unique_keys, inv = torch.unique(keys, dim=0, return_inverse=True)
+        # 对每个体素做平均
+        s_xyz = torch.zeros((unique_keys.shape[0], 3), device=xyz.device, dtype=xyz.dtype)
+        s_xyz.index_add_(0, inv, xyz)
+        counts = torch.bincount(inv, minlength=unique_keys.shape[0]).clamp_min(1).unsqueeze(1).to(s_xyz.dtype)
+        s_xyz = s_xyz / counts  # (Nv, 3)
+
+        outs.append(s_xyz)
+        lens.append(s_xyz.shape[0])
+
+    s_points = torch.cat(outs, dim=0) if len(outs) > 0 else points.new_zeros((0, 3))
+    s_len = torch.tensor(lens, device=points.device, dtype=batches_len.dtype)
+    return s_points, s_len
+
+
 def batch_grid_subsampling_kpconv_gpu(points, batches_len, features=None, labels=None, sampleDl=0.1, max_p=0):
     """
     Same as batch_grid_subsampling, but implemented in GPU. This is a hack by using Minkowski
@@ -223,21 +335,24 @@ def batch_grid_subsampling_kpconv_gpu(points, batches_len, features=None, labels
     if max_p != 0:
         raise NotImplementedError('subsampling only implemented by considering all points')
 
-    B = len(batches_len)
-    batch_start_end = torch.nn.functional.pad(torch.cumsum(batches_len, 0), (1, 0))
-    device = points[0].device
+    if _HAS_ME:
+        B = len(batches_len)
+        batch_start_end = torch.nn.functional.pad(torch.cumsum(batches_len, 0), (1, 0))
+        device = points[0].device
 
-    coord_batched = ME.utils.batched_coordinates(
-        [points[batch_start_end[b]:batch_start_end[b + 1]] / sampleDl for b in range(B)], device=device)
-    sparse_tensor = ME.SparseTensor(
-        features=points,
-        coordinates=coord_batched,
-        quantization_mode=ME.SparseTensorQuantizationMode.UNWEIGHTED_AVERAGE
-    )
+        coord_batched = ME.utils.batched_coordinates(
+            [points[batch_start_end[b]:batch_start_end[b + 1]] / sampleDl for b in range(B)], device=device)
+        sparse_tensor = ME.SparseTensor(
+            features=points,
+            coordinates=coord_batched,
+            quantization_mode=ME.SparseTensorQuantizationMode.UNWEIGHTED_AVERAGE
+        )
 
-    s_points = sparse_tensor.features
-    s_len = torch.tensor([f.shape[0] for f in sparse_tensor.decomposed_features], device=device)
-    return s_points, s_len
+        s_points = sparse_tensor.features
+        s_len = torch.tensor([f.shape[0] for f in sparse_tensor.decomposed_features], device=device)
+        return s_points, s_len
+    else:
+        return _voxel_subsample_torch(points, batches_len, sampleDl)
 
 
 def batch_neighbors_kpconv(queries, supports, q_batches, s_batches, radius, max_neighbors):

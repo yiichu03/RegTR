@@ -2,7 +2,7 @@
 instances for each dataset
 
 Simply download the pretrained weights from the project webpage, then run:
-    python demo.py EXAMPLE_IDX
+    python demo.py --example 0 EXAMPLE_IDX
 where EXAMPLE_IDX can be a number between 0-5 (defined at line 25)
 
 The registration results will be shown in a 3D visualizer.
@@ -23,22 +23,37 @@ from models.regtr import RegTR
 from utils.misc import load_config
 from utils.se3_numpy import se3_transform
 
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
 _examples = [
-    # 3DMatch examples
     # 0
+    ('../trained_models/3dmatch/ckpt/model-best.pth',
+     '../../rpmnet/RPMNet/snail_test/eagleg7/pcl/1696641932.283384803.pcd',
+     '../../rpmnet/RPMNet/snail_test/eagleg7/pcl/1696641932.551261428.pcd',
+    ),
+    
+    # 1
+    ('../trained_models/modelnet/ckpt/model-best.pth',
+     '../../rpmnet/RPMNet/snail_test/eagleg7/enhanced/1696641932.308438066.pcd',
+     '../../rpmnet/RPMNet/snail_test/eagleg7/enhanced/1696641932.558437828.pcd',
+    ),
+    # 3DMatch examples
+    # 0 2
     ('../trained_models/3dmatch/ckpt/model-best.pth',
      '../data/indoor/test/7-scenes-redkitchen/cloud_bin_0.pth',
      '../data/indoor/test/7-scenes-redkitchen/cloud_bin_5.pth'),
-    # 1
+    # 1 3
     ('../trained_models/3dmatch/ckpt/model-best.pth',
      '../data/indoor/test/sun3d-hotel_umd-maryland_hotel3/cloud_bin_8.pth',
      '../data/indoor/test/sun3d-hotel_umd-maryland_hotel3/cloud_bin_15.pth'),
-    # 2
+    # 2 4
     ('../trained_models/3dmatch/ckpt/model-best.pth',
      '../data/indoor/test/sun3d-home_at-home_at_scan1_2013_jan_1/cloud_bin_38.pth',
      '../data/indoor/test/sun3d-home_at-home_at_scan1_2013_jan_1/cloud_bin_41.pth'),
     # ModelNet examples
-    # 3
+    # 3 5
     ('../trained_models/modelnet/ckpt/model-best.pth',
      '../data/modelnet_demo_data/modelnet_test_2_0.ply',
      '../data/modelnet_demo_data/modelnet_test_2_1.ply'),
@@ -140,7 +155,7 @@ def visualize_result(src_xyz: np.ndarray, tgt_xyz: np.ndarray,
 def load_point_cloud(fname):
     if fname.endswith('.pth'):
         data = torch.load(fname)
-    elif fname.endswith('.ply'):
+    elif fname.endswith('.ply') or fname.endswith('.pcd'):
         pcd = o3d.io.read_point_cloud(fname)
         data = np.asarray(pcd.points)
     elif fname.endswith('.bin'):
